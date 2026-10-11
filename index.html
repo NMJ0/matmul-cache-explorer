@@ -1,0 +1,492 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Step through matrix multiply against a tiny LRU cache and compare cache misses across loop orders and tile sizes.">
+<title>Matmul Cache Explorer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+/* Layout: a lab bench. Controls on top, code + counters on the left, the three matrices on the right, a full comparison table below. */
+:root {
+  --bg: #F3F6F9;
+  --surface: #FFFFFF;
+  --ink: #1E2730;
+  --muted: #5D6B78;
+  --rule: #D8DFE7;
+  --accent: #1F4E79;
+  --accent-soft: #E3ECF5;
+  --cached: #C9DBEE;
+  --cell: #EEF2F6;
+  --miss: #C0504D;
+  --hit: #2E7D5B;
+  --tile: #D9822B;
+  --codebg: #22282E;
+  --codefg: #DCE3EA;
+  --codemuted: #7E8A96;
+  --codehl: #33404D;
+  --font-sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #10161C; --surface: #18212A; --ink: #E4EAF0; --muted: #94A2AF; --rule: #2B3743;
+    --accent: #7FB4E0; --accent-soft: #1E2F40; --cached: #27476A; --cell: #222D38;
+    --miss: #E5736F; --hit: #5BC293; --tile: #F0A04B;
+    --codebg: #0B1015; --codefg: #DCE3EA; --codemuted: #7E8A96; --codehl: #24313D;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #10161C; --surface: #18212A; --ink: #E4EAF0; --muted: #94A2AF; --rule: #2B3743;
+  --accent: #7FB4E0; --accent-soft: #1E2F40; --cached: #27476A; --cell: #222D38;
+  --miss: #E5736F; --hit: #5BC293; --tile: #F0A04B;
+  --codebg: #0B1015; --codefg: #DCE3EA; --codemuted: #7E8A96; --codehl: #24313D;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body {
+  background: var(--bg); color: var(--ink); font-family: var(--font-sans);
+  font-size: 15px; line-height: 1.5; padding: 0 16px; padding-block: 24px 48px;
+}
+.wrap { max-width: 1180px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }
+header h1 { font-size: 1.6rem; font-weight: 700; margin: 0; text-wrap: balance; letter-spacing: -0.01em; }
+header p { margin: 4px 0 0; color: var(--muted); max-width: 70ch; }
+.panel { background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; padding: 16px; }
+.label { font-size: 0.72rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+
+/* controls */
+.controls { display: flex; flex-wrap: wrap; gap: 16px 24px; align-items: flex-end; }
+.group { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+select, button {
+  font: inherit; font-size: 0.9rem; color: var(--ink); background: var(--surface);
+  border: 1px solid var(--rule); border-radius: 6px; padding: 6px 10px; cursor: pointer;
+}
+select { font-family: var(--font-mono); }
+button:hover, select:hover { border-color: var(--accent); }
+button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button.preset[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--surface); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--surface); font-weight: 600; min-width: 5.5em; }
+input[type="range"] { accent-color: var(--accent); width: 140px; }
+.speedval { font-family: var(--font-mono); font-size: 0.8rem; color: var(--muted); min-width: 6em; }
+
+/* main area */
+.main { display: grid; grid-template-columns: minmax(0, 360px) minmax(0, 1fr); gap: 20px; align-items: start; }
+@media (max-width: 860px) { .main { grid-template-columns: minmax(0, 1fr); } }
+.side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+
+pre.code {
+  margin: 0; background: var(--codebg); color: var(--codefg); border-radius: 8px;
+  padding: 12px 0; font-family: var(--font-mono); font-size: 0.82rem; line-height: 1.65; overflow-x: auto;
+}
+pre.code .ln { display: flex; justify-content: space-between; gap: 16px; padding: 0 14px; white-space: pre; }
+pre.code .ln.inner { background: var(--codehl); }
+pre.code .kw { color: #7FB4E0; }
+pre.code .val { color: var(--codemuted); }
+pre.code .val b { color: #F0C674; font-weight: 600; }
+
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.stat { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; background: var(--bg); border-radius: 6px; }
+.stat .num { font-family: var(--font-mono); font-size: 1.35rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat.total .num { color: var(--miss); }
+.progress { height: 6px; background: var(--cell); border-radius: 3px; overflow: hidden; margin-top: 10px; }
+.progress div { height: 100%; background: var(--accent); width: 0; }
+.meta { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 0.82rem; color: var(--muted); margin-top: 6px; font-variant-numeric: tabular-nums; }
+
+/* matrices */
+.mats { display: flex; flex-wrap: wrap; gap: 20px; justify-content: space-between; }
+.mat { flex: 1 1 220px; min-width: 0; max-width: 300px; display: flex; flex-direction: column; gap: 6px; }
+.mat h3 { margin: 0; font-size: 0.95rem; font-weight: 600; display: flex; justify-content: space-between; gap: 8px; }
+.mat h3 span { font-family: var(--font-mono); font-weight: 400; color: var(--muted); font-size: 0.8rem; }
+.grid { display: grid; row-gap: 3px; column-gap: 1px; position: relative; }
+.c { aspect-ratio: 1; background: var(--cell); border-radius: 0; transition: background-color 120ms; }
+.c.l0 { border-top-left-radius: 4px; border-bottom-left-radius: 4px; }
+.c.lN { border-top-right-radius: 4px; border-bottom-right-radius: 4px; }
+.c.cached { background: var(--cached); }
+.c.hit { background: var(--hit); }
+.c.miss { background: var(--miss); }
+.tilebox { border: 2.5px solid var(--tile); border-radius: 5px; pointer-events: none; margin: -3px; z-index: 1; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.82rem; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 14px; height: 14px; border-radius: 3px; display: inline-block; }
+.sw.box { background: transparent; border: 2.5px solid var(--tile); }
+
+.cache { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.cl {
+  font-family: var(--font-mono); font-size: 0.72rem; padding: 4px 6px; border-radius: 4px;
+  background: var(--cached); color: var(--ink); white-space: nowrap; min-width: 5.6em; text-align: center;
+}
+.cl.new { background: var(--miss); color: #fff; }
+.cl.used { outline: 2px solid var(--hit); outline-offset: -2px; }
+.cl.empty { background: transparent; border: 1px dashed var(--rule); color: var(--muted); }
+.cachehead { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.cachehead small { color: var(--muted); font-size: 0.78rem; }
+
+/* comparison */
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; font-variant-numeric: tabular-nums; min-width: 420px; width: auto; }
+th, td { padding: 6px 16px; min-width: 7.5em; text-align: right; border-bottom: 1px solid var(--rule); font-size: 0.88rem; }
+th { font-weight: 600; color: var(--muted); font-size: 0.78rem; letter-spacing: 0.04em; }
+th:first-child, td:first-child { text-align: left; font-family: var(--font-mono); }
+td.v { font-family: var(--font-mono); cursor: pointer; position: relative; }
+td.v:hover { outline: 1px solid var(--accent); outline-offset: -1px; }
+td.v.cur { outline: 2px solid var(--accent); outline-offset: -2px; font-weight: 600; }
+td.v .bar { position: absolute; left: 0; top: 0; bottom: 0; background: var(--miss); opacity: 0.16; }
+.note { font-size: 0.85rem; color: var(--muted); margin: 10px 0 0; max-width: 80ch; }
+.note code, header code { font-family: var(--font-mono); font-size: 0.85em; }
+@media (prefers-reduced-motion: reduce) { .c { transition: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Matmul Cache Explorer</h1>
+    <p>Watch <code>C[i][j] += A[i][k] * B[k][j]</code> run one iteration at a time against a tiny LRU cache. Change the loop order and the tile size and count the cache misses.</p>
+  </header>
+
+  <section class="panel controls" aria-label="Controls">
+    <div class="group">
+      <span class="label">Slide examples</span>
+      <div class="row">
+        <button class="preset" id="p-naive" data-order="ijk" data-tile="0">Naive ijk</button>
+        <button class="preset" id="p-reorder" data-order="ikj" data-tile="0">Reordered ikj</button>
+        <button class="preset" id="p-tiled" data-order="ikj" data-tile="4">Tiled + reordered</button>
+      </div>
+    </div>
+    <div class="group">
+      <label class="label" for="order">Loop order</label>
+      <select id="order">
+        <option>ijk</option><option>ikj</option><option>jik</option>
+        <option>jki</option><option>kij</option><option>kji</option>
+      </select>
+    </div>
+    <div class="group">
+      <label class="label" for="tile">Tile</label>
+      <select id="tile"></select>
+    </div>
+    <div class="group">
+      <label class="label" for="size">Matrix N</label>
+      <select id="size"><option value="8">8 × 8</option><option value="16">16 × 16</option></select>
+    </div>
+    <div class="group">
+      <label class="label" for="lines">Cache</label>
+      <select id="lines">
+        <option value="4">4 lines</option><option value="8" selected>8 lines</option><option value="16">16 lines</option>
+      </select>
+    </div>
+    <div class="group">
+      <span class="label">Run</span>
+      <div class="row">
+        <button class="primary" id="play">Play</button>
+        <button id="step">Step</button>
+        <button id="end">Run to end</button>
+        <button id="reset">Reset</button>
+      </div>
+    </div>
+    <div class="group">
+      <label class="label" for="speed">Speed</label>
+      <div class="row">
+        <input type="range" id="speed" min="0" max="100" value="35">
+        <span class="speedval" id="speedval"></span>
+      </div>
+    </div>
+  </section>
+
+  <div class="main">
+    <div class="side">
+      <pre class="code" id="code" aria-label="Current loop nest"></pre>
+      <section class="panel">
+        <span class="label">Cache misses</span>
+        <div class="stats" style="margin-top:8px">
+          <div class="stat"><span class="label">A</span><span class="num" id="mA">0</span></div>
+          <div class="stat"><span class="label">B</span><span class="num" id="mB">0</span></div>
+          <div class="stat"><span class="label">C</span><span class="num" id="mC">0</span></div>
+          <div class="stat total"><span class="label">Total</span><span class="num" id="mT">0</span></div>
+        </div>
+        <div class="progress"><div id="prog"></div></div>
+        <div class="meta"><span id="itr"></span><span id="rate"></span></div>
+        <div class="meta"><span id="minimum"></span></div>
+      </section>
+    </div>
+
+    <section class="panel" style="display:flex;flex-direction:column;gap:16px;min-width:0">
+      <div class="mats" id="mats"></div>
+      <div class="legend">
+        <span><i class="sw" style="background:var(--miss)"></i>miss: line fetched from memory</span>
+        <span><i class="sw" style="background:var(--hit)"></i>hit</span>
+        <span><i class="sw" style="background:var(--cached)"></i>line currently in cache</span>
+        <span id="tilelegend"><i class="sw box"></i>current tile</span>
+      </div>
+      <p class="note" style="margin:0">Matrices are row-major. Each rounded strip is one <b>cache line</b> holding <span id="lsz"></span> consecutive floats of a row, so a miss loads the whole strip.</p>
+      <div>
+        <div class="cachehead"><span class="label">Cache contents</span><small>least recently used on the left, evicted first</small></div>
+        <div class="cache" id="cache"></div>
+      </div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <span class="label">Total misses for every schedule</span>
+    <div class="tablewrap" style="margin-top:8px"><table id="cmp"></table></div>
+    <p class="note" id="cmpnote"></p>
+  </section>
+</div>
+
+<script>
+(() => {
+  const L = 4;                       // floats per cache line (scaled down from a real 64-byte line)
+  const $ = id => document.getElementById(id);
+  const S = { N: 8, order: 'ijk', T: 0, lines: 8 };
+  let its = [], pos = 0, cache = new Map(), misses = [0, 0, 0];
+  let last = null;                   // {acc:[{mat,r,c,line,hit}], it}
+  let playing = false, acc = 0, prevT = 0;
+  let cells = [], tileBoxes = [];
+
+  // ---- simulation ----
+  function iterations(N, order, T) {
+    const out = [], v = {};
+    const tiled = T && T < N;
+    const walk = (d, base, len) => {
+      if (d === 3) { out.push([v.i, v.j, v.k, tiled ? { ...base } : null]); return; }
+      const n = order[d];
+      for (let x = base[n]; x < base[n] + len; x++) { v[n] = x; walk(d + 1, base, len); }
+    };
+    if (!tiled) { walk(0, { i: 0, j: 0, k: 0 }, N); return out; }
+    for (let i0 = 0; i0 < N; i0 += T)
+      for (let j0 = 0; j0 < N; j0 += T)
+        for (let k0 = 0; k0 < N; k0 += T) walk(0, { i: i0, j: j0, k: k0 }, T);
+    return out;
+  }
+  const lineId = (mat, r, c, N) => mat * 100000 + Math.floor((r * N + c) / L);
+  function touch(map, id, cap) {
+    if (map.has(id)) { map.delete(id); map.set(id, 1); return true; }
+    map.set(id, 1);
+    if (map.size > cap) map.delete(map.keys().next().value);
+    return false;
+  }
+  function simulate(N, order, T, cap) {
+    const m = new Map(), out = [0, 0, 0];
+    for (const [i, j, k] of iterations(N, order, T)) {
+      if (!touch(m, lineId(0, i, k, N), cap)) out[0]++;
+      if (!touch(m, lineId(1, k, j, N), cap)) out[1]++;
+      if (!touch(m, lineId(2, i, j, N), cap)) out[2]++;
+    }
+    return out;
+  }
+  function stepOnce() {
+    if (pos >= its.length) return false;
+    const it = its[pos++], [i, j, k] = it, N = S.N;
+    const a = [[0, i, k], [1, k, j], [2, i, j]].map(([mat, r, c]) => {
+      const line = lineId(mat, r, c, N), hit = touch(cache, line, S.lines);
+      if (!hit) misses[mat]++;
+      return { mat, r, c, line, hit };
+    });
+    last = { acc: a, it };
+    return true;
+  }
+
+  // ---- building the view ----
+  function tileOptions() {
+    const sel = $('tile'), keep = S.T;
+    sel.innerHTML = '<option value="0">off</option>' +
+      [2, 4, 8].filter(t => t < S.N).map(t => `<option value="${t}">${t} × ${t}</option>`).join('');
+    S.T = [...sel.options].some(o => +o.value === keep) ? keep : 0;
+    sel.value = S.T;
+  }
+  function buildMats() {
+    const N = S.N, groups = N / L;
+    const cols = Array.from({ length: groups }, () => `repeat(${L}, minmax(0,1fr))`).join(' 5px ');
+    const names = [['A', 'A[i][k]'], ['B', 'B[k][j]'], ['C', 'C[i][j]']];
+    $('mats').innerHTML = '';
+    cells = []; tileBoxes = [];
+    names.forEach(([nm, idx], mat) => {
+      const box = document.createElement('div');
+      box.className = 'mat';
+      box.innerHTML = `<h3>${nm}<span>${idx}</span></h3>`;
+      const g = document.createElement('div');
+      g.className = 'grid';
+      g.style.gridTemplateColumns = cols;
+      const arr = [];
+      for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+        const d = document.createElement('div');
+        d.className = 'c' + (c % L === 0 ? ' l0' : '') + (c % L === L - 1 ? ' lN' : '');
+        d.style.gridRow = r + 1;
+        d.style.gridColumn = c + Math.floor(c / L) + 1;
+        g.appendChild(d); arr.push(d);
+      }
+      const tb = document.createElement('div');
+      tb.className = 'tilebox'; tb.hidden = true;
+      g.appendChild(tb);
+      cells.push(arr); tileBoxes.push(tb);
+      box.appendChild(g);
+      $('mats').appendChild(box);
+    });
+  }
+  const gridCol = c => c + Math.floor(c / L) + 1;
+  function placeTile(tb, r0, c0, T) {
+    tb.hidden = false;
+    tb.style.gridRow = `${r0 + 1} / ${r0 + T + 1}`;
+    tb.style.gridColumn = `${gridCol(c0)} / ${gridCol(c0 + T - 1) + 1}`;
+  }
+
+  function codeLines() {
+    const N = S.N, T = S.T, tiled = T && T < N, o = S.order;
+    const it = last ? last.it : null;
+    const val = (n) => it ? `${n} = <b>${n.length > 1 ? it[3][n[0]] : it['ijk'.indexOf(n)]}</b>` : '';
+    const kw = s => `<span class="kw">${s}</span>`;
+    const lines = [];
+    let ind = '';
+    if (tiled) {
+      for (const n of ['i', 'j', 'k']) {
+        lines.push([`${ind}${kw('for')} (${n}0 = 0; ${n}0 &lt; ${N}; ${n}0 += ${T})`, val(n + '0'), false]);
+        ind += '  ';
+      }
+    }
+    for (const n of o) {
+      const lo = tiled ? `${n}0` : '0', hi = tiled ? `${n}0+${T}` : `${N}`;
+      lines.push([`${ind}${kw('for')} (${n} = ${lo}; ${n} &lt; ${hi}; ${n}++)`, val(n), false]);
+      ind += '  ';
+    }
+    lines.push([`${ind}C[i][j] += A[i][k] * B[k][j];`, '', true]);
+    $('code').innerHTML = lines.map(([t, v, inner]) =>
+      `<div class="ln${inner ? ' inner' : ''}"><span>${t}</span><span class="val">${v}</span></div>`).join('');
+  }
+
+  function render() {
+    const N = S.N;
+    const cur = new Map();
+    if (last) for (const a of last.acc) cur.set(a.mat * 1e6 + a.r * N + a.c, a.hit ? 'hit' : 'miss');
+    for (let mat = 0; mat < 3; mat++) {
+      const arr = cells[mat];
+      for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+        const d = arr[r * N + c];
+        const st = cur.get(mat * 1e6 + r * N + c);
+        const inC = cache.has(lineId(mat, r, c, N));
+        d.classList.toggle('hit', st === 'hit');
+        d.classList.toggle('miss', st === 'miss');
+        d.classList.toggle('cached', !st && inC);
+      }
+    }
+    const tiled = S.T && S.T < N;
+    $('tilelegend').hidden = !tiled;
+    if (tiled && last) {
+      const b = last.it[3];
+      placeTile(tileBoxes[0], b.i, b.k, S.T);
+      placeTile(tileBoxes[1], b.k, b.j, S.T);
+      placeTile(tileBoxes[2], b.i, b.j, S.T);
+    } else tileBoxes.forEach(t => t.hidden = true);
+
+    // cache strip
+    const fresh = new Set(), used = new Set();
+    if (last) for (const a of last.acc) (a.hit ? used : fresh).add(a.line);
+    const ids = [...cache.keys()];
+    let html = ids.map(id => {
+      const mat = Math.floor(id / 100000), ln = id % 100000;
+      const r = Math.floor(ln * L / N), c0 = (ln * L) % N;
+      const cls = fresh.has(id) ? ' new' : used.has(id) ? ' used' : '';
+      return `<span class="cl${cls}">${'ABC'[mat]} r${r} c${c0}–${c0 + L - 1}</span>`;
+    }).join('');
+    for (let e = ids.length; e < S.lines; e++) html += '<span class="cl empty">empty</span>';
+    $('cache').innerHTML = html;
+
+    $('mA').textContent = misses[0];
+    $('mB').textContent = misses[1];
+    $('mC').textContent = misses[2];
+    const tot = misses[0] + misses[1] + misses[2];
+    $('mT').textContent = tot;
+    $('prog').style.width = (100 * pos / its.length) + '%';
+    $('itr').textContent = `iteration ${pos} / ${its.length}`;
+    $('rate').textContent = pos ? `miss rate ${(100 * tot / (3 * pos)).toFixed(1)}%` : 'miss rate –';
+    codeLines();
+    $('play').textContent = playing ? 'Pause' : (pos >= its.length ? 'Done' : 'Play');
+  }
+
+  function renderTable() {
+    const N = S.N, tiles = [0, ...[2, 4, 8].filter(t => t < N)];
+    const orders = ['ijk', 'ikj', 'jik', 'jki', 'kij', 'kji'];
+    const data = orders.map(o => tiles.map(t => simulate(N, o, t, S.lines).reduce((x, y) => x + y)));
+    const max = Math.max(...data.flat());
+    let h = '<thead><tr><th>order</th>' + tiles.map(t => `<th>${t ? `tile ${t}×${t}` : 'no tiling'}</th>`).join('') + '</tr></thead><tbody>';
+    orders.forEach((o, r) => {
+      h += `<tr><td>${o}</td>` + tiles.map((t, c) => {
+        const v = data[r][c], cur = o === S.order && t === S.T;
+        return `<td class="v${cur ? ' cur' : ''}" data-o="${o}" data-t="${t}" title="Load ${o}${t ? `, tile ${t}` : ''}">` +
+          `<span class="bar" style="width:${(100 * v / max).toFixed(1)}%"></span>${v}</td>`;
+      }).join('') + '</tr>';
+    });
+    $('cmp').innerHTML = h + '</tbody>';
+    const minimum = 3 * N * N / L;
+    $('cmpnote').innerHTML = `N = ${N}, cache of ${S.lines} lines × ${L} floats, LRU. Every schedule does the same ${N ** 3} multiply-adds and gives the same C; only the memory traffic changes. The floor is ${minimum} misses: each line of A, B and C loaded once. Click a cell to load that schedule.`;
+    $('minimum').textContent = `best possible: ${minimum} (every line loaded once)`;
+  }
+
+  function reset() {
+    playing = false;
+    its = iterations(S.N, S.order, S.T);
+    pos = 0; cache = new Map(); misses = [0, 0, 0]; last = null;
+    $('order').value = S.order; $('size').value = S.N; $('lines').value = S.lines; $('tile').value = S.T;
+    document.querySelectorAll('.preset').forEach(b =>
+      b.setAttribute('aria-pressed', String(b.dataset.order === S.order && +b.dataset.tile === S.T)));
+    $('lsz').textContent = L;
+    render();
+  }
+  function full() { tileOptions(); buildMats(); renderTable(); reset(); }
+
+  // ---- speed and playback ----
+  const speed = () => Math.round(Math.pow(10, $('speed').value / 100 * 3) );   // 1 .. 1000 it/s
+  function showSpeed() { $('speedval').textContent = `${speed()} it/s`; }
+  function frame(t) {
+    if (!playing) return;
+    const dt = Math.min(0.25, (t - prevT) / 1000); prevT = t;
+    acc += dt * speed();
+    let n = Math.floor(acc); acc -= n;
+    while (n-- > 0) if (!stepOnce()) { playing = false; break; }
+    render();
+    if (playing) requestAnimationFrame(frame);
+  }
+  function togglePlay() {
+    if (pos >= its.length) { reset(); }
+    playing = !playing;
+    if (playing) { prevT = performance.now(); acc = 1; requestAnimationFrame(frame); }
+    render();
+  }
+
+  // ---- wiring ----
+  $('play').onclick = togglePlay;
+  $('step').onclick = () => { playing = false; stepOnce(); render(); };
+  $('end').onclick = () => { playing = false; while (stepOnce()); render(); };
+  $('reset').onclick = reset;
+  $('speed').oninput = showSpeed;
+  $('order').onchange = e => { S.order = e.target.value; renderTable(); reset(); };
+  $('tile').onchange = e => { S.T = +e.target.value; renderTable(); reset(); };
+  $('size').onchange = e => { S.N = +e.target.value; full(); };
+  $('lines').onchange = e => { S.lines = +e.target.value; renderTable(); reset(); };
+  document.querySelectorAll('.preset').forEach(b => b.onclick = () => {
+    S.order = b.dataset.order; S.T = +b.dataset.tile; renderTable(); reset();
+  });
+  $('cmp').onclick = e => {
+    const td = e.target.closest('td.v'); if (!td) return;
+    S.order = td.dataset.o; S.T = +td.dataset.t; renderTable(); reset();
+  };
+  document.addEventListener('keydown', e => {
+    if (e.target.matches('select, input')) return;
+    if (e.key === ' ') { e.preventDefault(); togglePlay(); }
+    else if (e.key === 'ArrowRight') { playing = false; stepOnce(); render(); }
+    else if (e.key === 'r' || e.key === 'R') reset();
+  });
+
+  showSpeed();
+  full();
+  // open on a few steps of the naive schedule so the first view shows the idea
+  for (let s = 0; s < 11; s++) stepOnce();
+  render();
+})();
+</script>
+</body>
+</html>
